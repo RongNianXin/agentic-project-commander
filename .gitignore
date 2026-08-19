@@ -8,6 +8,7 @@ Desktop.ini
 .vscode/
 *.swp
 *.swo
+~$*
 
 # Local environment and secrets
 .env
