@@ -1,12 +1,12 @@
-# Agentic Project Commander
+# Codex Workflows
 
-Agentic Project Commander 是一套可下载、可审计的 AI 协作工作流模板。第二代公开版当前版本为 `2026-08-12.18`。
+Codex Workflows 是一套面向 Codex Desktop 的可下载、可审计 AI 协作工作流和本地辅助工具。第二代公开版当前版本为 `2026-08-19.5`。
 
 本仓库只包含通用规则、模板与安全边界，不包含任何来源项目的业务、人员、组织、仓库或内部技术信息。新用户不需要第一代提示词或历史资料。
 
 ## 下载后 3 步启动
 
-1. 使用 GitHub 的 **Code → Download ZIP** 下载并解压，或克隆本仓库；确认根目录直接包含 `00`～`10` 文档。
+1. 使用 GitHub 的 **Code → Download ZIP** 下载并解压，或克隆本仓库；确认根目录直接包含 `00`～`10` 文档和 `总指挥轻量交接启动配置.md`。
 2. 打开 [01-操作者操作手册.md](01-操作者操作手册.md)，找到“登记规则文档目录”，复制其中提示词并把占位符替换为本仓库的本地绝对路径。
 3. 在 Codex Desktop 中打开真正要开发或管理的目标项目，发送登记提示词；登记通过后发送操作手册中的“场景 1”，再按需要选择其他场景。
 
@@ -19,8 +19,16 @@ Agentic Project Commander 是一套可下载、可审计的 AI 协作工作流�
 - [00-第二代工作流总览.md](00-第二代工作流总览.md)：规则注册表、阅读顺序与整体边界。
 - [01-操作者操作手册.md](01-操作者操作手册.md)：面向使用者的启动步骤与可直接复制的场景提示词。
 - `02`～`10`：总指挥核心规则、任务模板、交接、模型、复盘、迁移、授权和状态索引规范。
+- [总指挥轻量交接启动配置.md](总指挥轻量交接启动配置.md)：正常交接候选阶段的精简读取配置。
 - [docs/WORKFLOW_OVERVIEW.md](docs/WORKFLOW_OVERVIEW.md)：仓库内的导航说明。
 - [docs/SECURITY_BOUNDARY.md](docs/SECURITY_BOUNDARY.md)：公开信息与脱敏边界。
+- [tools/session-health-check/README.md](tools/session-health-check/README.md)：检查本地会话容量、压缩次数和交接观察指标。
+
+## 本地会话检查工具
+
+`tools/session-health-check` 提供一个只读 PowerShell 脚本及公开版 DOCX 使用说明。脚本接受 Codex 任务 ID，定位本机会话文件并显示文件大小、自动压缩次数、最近输入占窗口比例和交接建议。
+
+工具中的容量、压缩次数和 85% 观察线都是本地经验规则，不是 OpenAI 官方限制；是否交接仍需结合任务是否处于稳定断点以及 AI 是否出现明显理解不足。
 
 ## 适用范围
 
