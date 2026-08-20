@@ -32,14 +32,24 @@ dist/
 build/
 coverage/
 .cache/
+/.codex-manual-cache/
+/.migration-backup/
 
 # Private local material: never track or publish
 /其他资料/
+/全局提示词（严禁AI自动修改）/
 
 # Local workflow history: useful locally, not part of the public package
 /第二代总指挥的工作模式/task_plan.md
 /第二代总指挥的工作模式/findings.md
 /第二代总指挥的工作模式/progress.md
 
-# Private Word source; publish only the separately sanitized public edition
+# Private Word sources; publish only the separately sanitized public edition
 /实用小工具/查看当前任务本地对话的文件大小/查看当前任务本地对话文件大小.docx
+/实用小工具/查看当前任务本地对话的文件大小/查看当前任务本地对话文件大小(自用).docx
+
+# Generated migration reports can contain local task identifiers and paths
+**/stage-a-report.json
+
+# Unfinished local draft: publish after substantive content is added
+/故障排查与解决经验/CC switch 不同对话窗口扣费途径不同/codex同一账号，不同对话窗口扣费渠道不同.md
