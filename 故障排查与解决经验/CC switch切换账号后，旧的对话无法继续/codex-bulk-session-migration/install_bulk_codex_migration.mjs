@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   access,
+  chmod,
   copyFile,
+  mkdtemp,
   mkdir,
   open,
   readdir,
@@ -13,10 +15,10 @@ import {
   rename,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   FORMAT_VERSION,
   sha256File,
@@ -32,9 +34,8 @@ const CC_SWITCH_HOME = join(USER_HOME, ".cc-switch");
 const SESSION_ROOT = join(CODEX_HOME, "sessions");
 const SESSION_SCOPE = "unarchived-only";
 const BACKUP_ROOT = join(USER_HOME, "Documents", "Codex", "CodexSessionBackups");
-const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
-const STAGE_A_REPORT = join(PACKAGE_DIR, "stage-a-report.json");
-const SESSION_FILE_PATTERN = /^rollout-.*-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/i;
+const TASK_ID_PATTERN = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const SESSION_FILE_PATTERN = /^rollout-.*-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i;
 const BLOCKING_PROCESSES = new Set([
   "cc-switch.exe",
   "cc_switch.exe",
@@ -60,6 +61,42 @@ async function exists(path) {
 
 function timestamp() {
   return new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
+}
+
+const FILE_TIME_TOLERANCE_MS = 2000;
+
+async function restoreOriginalFileMetadata(path, file) {
+  if (!Number.isFinite(file.originalAtimeMs) || !Number.isFinite(file.originalMtimeMs)) {
+    return false;
+  }
+  if (Number.isInteger(file.originalMode)) {
+    await chmod(path, file.originalMode & 0o777);
+  }
+  await utimes(path, new Date(file.originalAtimeMs), new Date(file.originalMtimeMs));
+  const restored = await stat(path);
+  if (Math.abs(restored.mtimeMs - file.originalMtimeMs) > FILE_TIME_TOLERANCE_MS) {
+    fail(`无法恢复源文件修改时间：${path}`);
+  }
+  if (
+    process.platform !== "win32" &&
+    Number.isInteger(file.originalMode) &&
+    (restored.mode & 0o777) !== (file.originalMode & 0o777)
+  ) {
+    fail(`无法恢复源文件权限：${path}`);
+  }
+  return true;
+}
+
+function parseTaskSelector(args) {
+  if (args.length === 0) return null;
+  if (args.length !== 2 || args[0] !== "--task" || !TASK_ID_PATTERN.test(args[1])) {
+    fail("指定单个任务时必须使用：--apply --task <UUID>");
+  }
+  return args[1].toLowerCase();
+}
+
+function taskIdFromSessionPath(path) {
+  return basename(path).match(SESSION_FILE_PATTERN)?.[1]?.toLowerCase() ?? null;
 }
 
 function parseTaskListCsv(line) {
@@ -129,9 +166,11 @@ async function* walk(root) {
   }
 }
 
-async function discoverSessions() {
+async function discoverSessions(taskId = null) {
   const paths = [];
-  for await (const path of walk(SESSION_ROOT)) paths.push(path);
+  for await (const path of walk(SESSION_ROOT)) {
+    if (taskId === null || taskIdFromSessionPath(path) === taskId) paths.push(path);
+  }
   return paths.sort();
 }
 
@@ -215,6 +254,7 @@ async function backupAuxiliaryFiles(backupDir) {
 async function prepareCandidates(runId, paths, manifest, manifestPath) {
   for (let index = 0; index < paths.length; index += 1) {
     const source = paths[index];
+    const sourceStat = await stat(source);
     const candidate = `${source}.${runId}.candidate`;
     const rollback = `${source}.${runId}.original`;
     if ((await exists(candidate)) || (await exists(rollback))) {
@@ -225,12 +265,16 @@ async function prepareCandidates(runId, paths, manifest, manifestPath) {
       await rm(candidate, { force: true });
     } else {
       await validateCandidate(candidate, result);
+      await fsyncFile(candidate);
       manifest.files.push({
         source,
         relativePath: relative(CODEX_HOME, source),
         candidate,
         rollback,
         backup: null,
+        originalAtimeMs: sourceStat.atimeMs,
+        originalMtimeMs: sourceStat.mtimeMs,
+        originalMode: sourceStat.mode,
         status: "candidate-validated",
         ...result,
       });
@@ -276,6 +320,17 @@ async function commitCandidates(manifest, manifestPath) {
   try {
     for (let index = 0; index < manifest.files.length; index += 1) {
       const file = manifest.files[index];
+      const currentSourceStat = await stat(file.source);
+      if (Math.abs(currentSourceStat.mtimeMs - file.originalMtimeMs) > FILE_TIME_TOLERANCE_MS) {
+        fail(`源文件修改时间在准备后发生变化：${file.source}`);
+      }
+      if (
+        process.platform !== "win32" &&
+        Number.isInteger(file.originalMode) &&
+        (currentSourceStat.mode & 0o777) !== (file.originalMode & 0o777)
+      ) {
+        fail(`源文件权限在准备后发生变化：${file.source}`);
+      }
       if ((await sha256File(file.source)) !== file.sourceSha256) {
         fail(`源文件在备份后发生变化：${file.source}`);
       }
@@ -292,6 +347,7 @@ async function commitCandidates(manifest, manifestPath) {
       if ((await sha256File(file.source)) !== file.candidateSha256) {
         fail(`提交后哈希不匹配：${file.source}`);
       }
+      await restoreOriginalFileMetadata(file.source, file);
       file.status = "committed";
       manifest.progress.committed = index + 1;
       await writeManifest(manifestPath, manifest);
@@ -329,25 +385,25 @@ async function commitCandidates(manifest, manifestPath) {
   }
 }
 
-async function applyMigration() {
+async function applyMigration(taskId = null) {
   assertApplicationsClosed();
-  const stageA = JSON.parse(await readFile(STAGE_A_REPORT, "utf8"));
-  if (stageA?.success !== true || stageA?.sanitizerFormatVersion !== FORMAT_VERSION) {
-    fail("阶段 A 报告无效或转换器版本不匹配");
-  }
-
   const runId = `bulk-${timestamp()}`;
   const backupDir = join(BACKUP_ROOT, runId);
   await mkdir(BACKUP_ROOT, { recursive: true });
   await mkdir(backupDir, { recursive: false });
   const manifestPath = join(backupDir, "manifest.json");
-  const paths = await discoverSessions();
+  const paths = await discoverSessions(taskId);
   await assertSessionPathsInScope(paths);
-  console.log(`仅扫描当前未归档任务：${paths.length} 个；已归档任务不会扫描或修改。`);
+  if (taskId !== null && paths.length !== 1) {
+    fail(`当前未归档任务中未找到唯一匹配项：${taskId}（找到 ${paths.length} 个）`);
+  }
+  const scopeDescription = taskId === null ? "全部当前未归档任务" : `指定任务 ${taskId}`;
+  console.log(`仅扫描${scopeDescription}：${paths.length} 个文件；已归档任务不会扫描或修改。`);
   const manifest = {
     schemaVersion: 1,
     sanitizerFormatVersion: FORMAT_VERSION,
-    sessionScope: SESSION_SCOPE,
+    sessionScope: taskId === null ? SESSION_SCOPE : "single-unarchived-task",
+    selectedTaskId: taskId,
     sessionRoot: SESSION_ROOT,
     runId,
     status: "preparing",
@@ -363,6 +419,13 @@ async function applyMigration() {
     await prepareCandidates(runId, paths, manifest, manifestPath);
     manifest.status = "candidates-validated";
     await writeManifest(manifestPath, manifest);
+    if (manifest.files.length === 0) {
+      manifest.status = "no-changes";
+      manifest.completedAt = new Date().toISOString();
+      await writeManifest(manifestPath, manifest);
+      console.log(`未发现需要迁移的加密字段，未修改任务文件。记录目录：${backupDir}`);
+      return;
+    }
     manifest.auxiliary = await backupAuxiliaryFiles(backupDir);
     await backupSources(backupDir, manifest, manifestPath);
     manifest.status = "backups-verified";
@@ -376,7 +439,7 @@ async function applyMigration() {
     await writeManifest(manifestPath, manifest).catch(() => {});
     throw error;
   }
-  console.log(`批量迁移已安装。迁移文件：${manifest.files.length}；备份目录：${backupDir}`);
+  console.log(`迁移已安装。迁移文件：${manifest.files.length}；备份目录：${backupDir}`);
 }
 
 async function latestRestorableManifest() {
@@ -423,9 +486,13 @@ async function rollbackLatest() {
       const current = `${file.source}.${process.pid}.pre-restore`;
       await rename(file.source, current);
       restored.push({ file, current });
+      let replacementInstalled = false;
       try {
         await rename(temporary, file.source);
+        replacementInstalled = true;
+        await restoreOriginalFileMetadata(file.source, file);
       } catch (error) {
+        if (replacementInstalled) await rm(file.source, { force: true });
         await rename(current, file.source);
         restored.pop();
         throw error;
@@ -470,6 +537,13 @@ async function selfTest() {
   ) {
     fail("正式会话文件识别自测失败");
   }
+  const sampleTaskId = "00000000-0000-0000-0000-000000000000";
+  if (
+    parseTaskSelector(["--task", sampleTaskId]) !== sampleTaskId ||
+    taskIdFromSessionPath(`rollout-2026-08-13T00-00-00-${sampleTaskId}.jsonl`) !== sampleTaskId
+  ) {
+    fail("单任务选择器自测失败");
+  }
   if (
     SESSION_SCOPE !== "unarchived-only" ||
     SESSION_ROOT !== join(CODEX_HOME, "sessions") ||
@@ -479,12 +553,37 @@ async function selfTest() {
   }
   const paths = await discoverSessions();
   await assertSessionPathsInScope(paths);
+  const timeTestRoot = await mkdtemp(join(tmpdir(), "codex-migration-times-"));
+  try {
+    const timeTestFile = join(timeTestRoot, "rollout-test.jsonl");
+    await writeFile(timeTestFile, "candidate\n", "utf8");
+    const expectedAtime = new Date("2024-01-02T03:04:05.000Z");
+    const expectedMtime = new Date("2024-02-03T04:05:06.000Z");
+    const originalMode = (await stat(timeTestFile)).mode;
+    await restoreOriginalFileMetadata(timeTestFile, {
+      originalAtimeMs: expectedAtime.getTime(),
+      originalMtimeMs: expectedMtime.getTime(),
+      originalMode,
+    });
+    const restored = await stat(timeTestFile);
+    if (Math.abs(restored.mtimeMs - expectedMtime.getTime()) > FILE_TIME_TOLERANCE_MS) {
+      fail("会话时间戳保留自测失败");
+    }
+  } finally {
+    await rm(timeTestRoot, { recursive: true, force: true });
+  }
   console.log("PASS: bulk installer process guard");
+  console.log("PASS: exact task UUID selector");
   console.log(`PASS: ${paths.length} unarchived sessions are in scope; archived sessions are excluded`);
+  console.log("PASS: migrated sessions preserve original timestamps and file mode");
 }
 
 const mode = process.argv[2];
-if (mode === "--apply") await applyMigration();
+if (mode === "--apply") await applyMigration(parseTaskSelector(process.argv.slice(3)));
 else if (mode === "--rollback-latest") await rollbackLatest();
 else if (mode === "--self-test") await selfTest();
-else console.log("未修改任何文件。参数：--apply、--rollback-latest、--self-test");
+else {
+  console.log(
+    "未修改任何文件。参数：--apply [--task <UUID>]、--rollback-latest、--self-test",
+  );
+}

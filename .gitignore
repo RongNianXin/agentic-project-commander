@@ -38,6 +38,7 @@ coverage/
 # Private local material: never track or publish
 /其他资料/
 /全局提示词（严禁AI自动修改）/
+/Codex提示词优化工程_阿荣/
 
 # Local workflow history: useful locally, not part of the public package
 /第二代总指挥的工作模式/task_plan.md
