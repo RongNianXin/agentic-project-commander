@@ -54,5 +54,8 @@ coverage/
 # Generated migration reports can contain local task identifiers and paths
 **/stage-a-report.json
 
+# Generated session analysis reports contain full user input
+**/*-详细分析报告.md
+
 # Unfinished local draft: publish after substantive content is added
 /故障排查与解决经验/CC switch 不同对话窗口扣费途径不同/codex同一账号，不同对话窗口扣费渠道不同.md
