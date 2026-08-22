@@ -4,14 +4,17 @@ param(
     [Alias('Id')]
     [string]$TaskId,
 
-    [switch]$ShowTurnPreview
+    [switch]$ShowTurnPreview,
+
+    [string]$ReportPath
 )
 
 # 支持三种用法：
 #   .\check-codex-session.ps1 -TaskId '任务 ID'
 #   .\check-codex-session.ps1 '任务 ID'
-#   .\check-codex-session.ps1 -TaskId '任务 ID' -ShowTurnPreview
+#   .\check-codex-session.ps1 -TaskId '任务 ID' -ReportPath '报告路径.md'
 #   .\check-codex-session.ps1                 # 根据提示输入任务 ID
+# -ShowTurnPreview 作为旧命令兼容参数保留；详细报告固定包含前三高消耗回合的完整用户输入。
 if ([string]::IsNullOrWhiteSpace($TaskId)) {
     $TaskId = Read-Host '请输入 Codex 任务 ID'
 }
@@ -119,22 +122,133 @@ function Format-EventTimestamp {
     }
 }
 
-function Format-TurnPreview {
+function Get-MarkdownFence {
     param(
-        [string]$Value,
-        [int]$MaximumLength = 48
+        [string]$Value
     )
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return ''
+    $backtick = ([char]0x60).ToString()
+    $maximumRun = 0
+    foreach ($match in [regex]::Matches($Value, $backtick + '+')) {
+        $maximumRun = [Math]::Max($maximumRun, $match.Length)
     }
 
-    $normalized = [regex]::Replace($Value, '\s+', ' ').Trim()
-    if ($normalized.Length -le $MaximumLength) {
-        return $normalized
+    return $backtick * [Math]::Max(3, $maximumRun + 1)
+}
+
+function Add-ReportLine {
+    param(
+        [Parameter(Mandatory)]
+        [Text.StringBuilder]$Builder,
+
+        [AllowEmptyString()]
+        [string]$Value = ''
+    )
+
+    [void]$Builder.Append($Value)
+    [void]$Builder.Append([Environment]::NewLine)
+}
+
+function Get-DetailedReportPath {
+    param(
+        [string]$RequestedPath,
+        [Parameter(Mandatory)]
+        [string]$CurrentTaskId
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        return [IO.Path]::GetFullPath($RequestedPath)
     }
 
-    return $normalized.Substring(0, $MaximumLength) + '…'
+    $localAppData = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::LocalApplicationData
+    )
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        $localAppData = Join-Path $env:USERPROFILE 'AppData\Local'
+    }
+
+    $reportDirectory = Join-Path $localAppData 'Codex会话交接评估\报告'
+    return Join-Path $reportDirectory "$CurrentTaskId-详细分析报告.md"
+}
+
+function Write-Utf8BomFileAtomic {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Content
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $directory = [IO.Path]::GetDirectoryName($fullPath)
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        throw "详细报告路径缺少目录：$Path"
+    }
+
+    [void][IO.Directory]::CreateDirectory($directory)
+    $temporaryName = '.{0}.{1}.{2}.tmp' -f `
+        [IO.Path]::GetFileName($fullPath), `
+        $PID, `
+        [Guid]::NewGuid().ToString('N')
+    $temporaryPath = Join-Path $directory $temporaryName
+    $backupPath = $fullPath + '.replace-backup'
+    $encoding = [Text.UTF8Encoding]::new($true, $true)
+
+    try {
+        [IO.File]::WriteAllText($temporaryPath, $Content, $encoding)
+        $bytes = [IO.File]::ReadAllBytes($temporaryPath)
+        if (
+            $bytes.Length -lt 3 -or
+            $bytes[0] -ne 0xEF -or
+            $bytes[1] -ne 0xBB -or
+            $bytes[2] -ne 0xBF
+        ) {
+            throw '详细报告没有写入 UTF-8 BOM。'
+        }
+
+        $roundTrip = [IO.File]::ReadAllText($temporaryPath, $encoding)
+        if ($roundTrip -cne $Content) {
+            throw '详细报告写后回读内容不一致。'
+        }
+
+        if ([IO.File]::Exists($fullPath)) {
+            if ([IO.File]::Exists($backupPath)) {
+                [IO.File]::Delete($backupPath)
+            }
+            [IO.File]::Replace($temporaryPath, $fullPath, $backupPath)
+            if ([IO.File]::Exists($backupPath)) {
+                try {
+                    [IO.File]::Delete($backupPath)
+                }
+                catch {
+                    # 报告已经原子替换成功；固定备份路径会在下次运行前继续清理。
+                }
+            }
+        }
+        else {
+            [IO.File]::Move($temporaryPath, $fullPath)
+        }
+    }
+    catch {
+        if ([IO.File]::Exists($temporaryPath)) {
+            [IO.File]::Delete($temporaryPath)
+        }
+        if (
+            [IO.File]::Exists($backupPath) -and
+            [IO.File]::Exists($fullPath)
+        ) {
+            try {
+                [IO.File]::Delete($backupPath)
+            }
+            catch {
+                # 保留旧备份比在错误处理中再次破坏目标文件更安全。
+            }
+        }
+        throw "写入详细分析报告失败，旧报告未被破坏：$($_.Exception.Message)"
+    }
+
+    return $fullPath
 }
 
 function Get-JsonlTextFormat {
@@ -476,7 +590,7 @@ function Get-OrCreateTurnUsage {
             EndBytes = [long]-1
             StartTimestamp = $StartTimestamp
             EndTimestamp = ''
-            UserPreview = ''
+            UserInput = ''
             InputTokens = [long]0
             CachedInputTokens = [long]0
             OutputTokens = [long]0
@@ -752,7 +866,7 @@ try {
                 $turnIdToIndex[$recordTurnId] = $currentTurnIndex
             }
 
-            if ($ShowTurnPreview -and [string]::IsNullOrWhiteSpace($turnUsage.UserPreview)) {
+            if ([string]::IsNullOrWhiteSpace($turnUsage.UserInput)) {
                 try {
                     $userRecord = $line | ConvertFrom-Json -ErrorAction Stop
                     $messageProperty = $userRecord.payload.PSObject.Properties['message']
@@ -760,7 +874,7 @@ try {
                         $null -ne $messageProperty -and
                         $messageProperty.Value -is [string]
                     ) {
-                        $turnUsage.UserPreview = Format-TurnPreview ([string]$messageProperty.Value)
+                        $turnUsage.UserInput = [string]$messageProperty.Value
                     }
                 }
                 catch {
@@ -1148,6 +1262,127 @@ $fileRankings = @(
         Select-Object -First 3
 )
 
+$resolvedReportPath = Get-DetailedReportPath `
+    -RequestedPath $ReportPath `
+    -CurrentTaskId $taskId
+if ([IO.Path]::GetExtension($resolvedReportPath) -ine '.md') {
+    throw "详细报告必须使用 .md 扩展名：$resolvedReportPath"
+}
+if (
+    [string]::Equals(
+        [IO.Path]::GetFullPath($resolvedReportPath),
+        [IO.Path]::GetFullPath($file.FullName),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+) {
+    throw '详细报告路径不能与会话 JSONL 文件相同。'
+}
+$reportBuilder = [Text.StringBuilder]::new()
+Add-ReportLine -Builder $reportBuilder -Value '# Codex 会话详细分析报告'
+Add-ReportLine -Builder $reportBuilder
+Add-ReportLine -Builder $reportBuilder -Value "- 任务 ID：$taskId"
+Add-ReportLine -Builder $reportBuilder -Value "- 会话文件：$($file.FullName)"
+Add-ReportLine -Builder $reportBuilder -Value "- 生成时间：$([DateTimeOffset]::Now.ToString('yyyy-MM-dd HH:mm:ss zzz'))"
+Add-ReportLine -Builder $reportBuilder -Value '- 编码：UTF-8 BOM'
+Add-ReportLine -Builder $reportBuilder
+Add-ReportLine -Builder $reportBuilder -Value '> 本报告包含完整用户输入，可能带有本地路径、内部信息或其他敏感内容；请只在本地受控范围内使用。'
+Add-ReportLine -Builder $reportBuilder
+Add-ReportLine -Builder $reportBuilder -Value '## Token 消耗最高回合'
+Add-ReportLine -Builder $reportBuilder
+Add-ReportLine -Builder $reportBuilder -Value '按本地累计 Token 快照增量排序。M tokens 表示百万 Token；MiB 表示本地文件字节，二者不能固定换算。'
+Add-ReportLine -Builder $reportBuilder
+
+if ($tokenRankings.Count -gt 0 -and $tokenAdvanceCount -gt 0) {
+    $rankNames = @('第一', '第二', '第三')
+    for ($index = 0; $index -lt $tokenRankings.Count; $index++) {
+        $item = $tokenRankings[$index]
+        $totalText = Format-TokenValue $item.TotalTokens
+        $inputText = Format-TokenValue $item.InputTokens
+        $cachedText = Format-TokenValue $item.CachedInputTokens
+        $outputText = Format-TokenValue $item.OutputTokens
+        $reasoningText = Format-TokenValue $item.ReasoningTokens
+        Add-ReportLine -Builder $reportBuilder -Value "### $($rankNames[$index])：第 $($item.TurnIndex) 轮（$($item.Status)）"
+        Add-ReportLine -Builder $reportBuilder
+        Add-ReportLine -Builder $reportBuilder -Value "$totalText tokens；输入 $inputText（其中缓存 $cachedText），输出 $outputText（其中推理 $reasoningText）。"
+
+        $locatorParts = @()
+        $timestamp = if (-not [string]::IsNullOrWhiteSpace($item.EndTimestamp)) {
+            Format-EventTimestamp $item.EndTimestamp
+        }
+        else {
+            Format-EventTimestamp $item.StartTimestamp
+        }
+        if (-not [string]::IsNullOrWhiteSpace($timestamp)) {
+            $locatorParts += "事件时间 $timestamp"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($item.TurnId)) {
+            $suffixStart = [Math]::Max(0, $item.TurnId.Length - 8)
+            $locatorParts += "回合 ID 尾号 $($item.TurnId.Substring($suffixStart))"
+        }
+        $turnFileBytes = [Math]::Max(
+            0,
+            [long]$item.EndBytes - [long]$item.StartBytes
+        )
+        $locatorParts += "本轮 JSONL 增长 $(Format-MiB $turnFileBytes)"
+        Add-ReportLine -Builder $reportBuilder -Value "定位：$($locatorParts -join '；')。"
+        Add-ReportLine -Builder $reportBuilder
+        Add-ReportLine -Builder $reportBuilder -Value '用户输入（完整）：'
+        Add-ReportLine -Builder $reportBuilder
+        if (-not [string]::IsNullOrWhiteSpace($item.UserInput)) {
+            $fence = Get-MarkdownFence $item.UserInput
+            Add-ReportLine -Builder $reportBuilder -Value $fence
+            [void]$reportBuilder.Append($item.UserInput)
+            if (
+                -not $item.UserInput.EndsWith("`n") -and
+                -not $item.UserInput.EndsWith("`r")
+            ) {
+                [void]$reportBuilder.Append([Environment]::NewLine)
+            }
+            Add-ReportLine -Builder $reportBuilder -Value $fence
+        }
+        else {
+            Add-ReportLine -Builder $reportBuilder -Value '未从本地记录取得该回合的用户输入。'
+        }
+        Add-ReportLine -Builder $reportBuilder
+    }
+}
+else {
+    Add-ReportLine -Builder $reportBuilder -Value '无法可靠取得：当前文件没有可用的累计 Token 增量。'
+    Add-ReportLine -Builder $reportBuilder
+}
+
+Add-ReportLine -Builder $reportBuilder -Value '## 本地会话文件占用前三'
+Add-ReportLine -Builder $reportBuilder
+Add-ReportLine -Builder $reportBuilder -Value '本节反映 JSONL 文件构成，不等同于 Token 消耗。'
+Add-ReportLine -Builder $reportBuilder
+if ($fileRankings.Count -gt 0 -and $scanEndPosition -gt 0) {
+    $rankNames = @('第一', '第二', '第三')
+    for ($index = 0; $index -lt $fileRankings.Count; $index++) {
+        $item = $fileRankings[$index]
+        $percentage = [Math]::Round(
+            100 * [double]$item.Value / [double]$scanEndPosition,
+            1
+        ).ToString('F1', [Globalization.CultureInfo]::InvariantCulture)
+        $recordCount = if ($categoryRecords.ContainsKey($item.Key)) {
+            $categoryRecords[$item.Key]
+        }
+        else {
+            0
+        }
+        $byteText = Format-ByteSize $item.Value
+        Add-ReportLine -Builder $reportBuilder -Value "$($rankNames[$index])：$($item.Key)，$byteText，占 $percentage%，涉及 $recordCount 条记录。"
+        Add-ReportLine -Builder $reportBuilder
+    }
+}
+else {
+    Add-ReportLine -Builder $reportBuilder -Value '无法取得：未扫描到完整的本地会话记录。'
+}
+
+$reportText = $reportBuilder.ToString()
+$resolvedReportPath = Write-Utf8BomFileAtomic `
+    -Path $resolvedReportPath `
+    -Content $reportText
+
 '一、基本信息'
 Format-StatusLine '任务 ID：' $taskId
 Format-StatusLine '会话存储状态：' $storageState
@@ -1160,7 +1395,7 @@ Format-StatusLine '上下文压缩：' "$compactCount 次"
 Format-StatusLine '回合统计：' "已完成 $completedTurnCount 轮；已中止 $abortedTurnCount 轮；未结束 $unfinishedTurnCount 轮"
 Format-StatusLine '回合识别：' "原始 turn_context $turnContextRecordCount 条；按 turn_id/终止边界合并重复 $duplicateTurnContextCount 条；识别 $startedTurnCount 轮"
 
-foreach ($milestone in @(1, 5, 15, 20)) {
+for ($milestone = 5; $milestone -le $completedTurnCount; $milestone += 5) {
     $milestoneLabel = '{0:D2} 轮完成后文件大小：' -f $milestone
     if ($completedSizeByOrdinal.ContainsKey($milestone)) {
         $milestoneText = Format-MiB $completedSizeByOrdinal[$milestone]
@@ -1183,88 +1418,21 @@ if ($startedTurnCount -gt 0) {
 else {
     Format-StatusLine '最新回合与文件：' "未识别到回合；$sizeText"
 }
+Format-StatusLine '详细分析报告：' $resolvedReportPath
 
 ''
-'三、主要消耗分析'
-'单位说明：M tokens 表示百万 Token；MiB 表示本地文件字节（1 MiB = 1,048,576 B），二者不能固定换算。'
-'Token 消耗最高回合（按本地累计 Token 快照增量）：'
-if ($tokenRankings.Count -gt 0 -and $tokenAdvanceCount -gt 0) {
-    $rankNames = @('第一', '第二', '第三')
-    for ($index = 0; $index -lt $tokenRankings.Count; $index++) {
-        $item = $tokenRankings[$index]
-        $totalText = Format-TokenValue $item.TotalTokens
-        $totalExactText = Format-Integer $item.TotalTokens
-        $inputText = Format-TokenValue $item.InputTokens
-        $cachedText = Format-TokenValue $item.CachedInputTokens
-        $outputText = Format-TokenValue $item.OutputTokens
-        $reasoningText = Format-TokenValue $item.ReasoningTokens
-        "  $($rankNames[$index])：第 $($item.TurnIndex) 轮（$($item.Status)），$totalText tokens（精确值 $totalExactText）；输入 $inputText（其中缓存 $cachedText），输出 $outputText（其中推理 $reasoningText）。"
-
-        $locatorParts = @()
-        $timestamp = if (-not [string]::IsNullOrWhiteSpace($item.EndTimestamp)) {
-            Format-EventTimestamp $item.EndTimestamp
-        }
-        else {
-            Format-EventTimestamp $item.StartTimestamp
-        }
-        if (-not [string]::IsNullOrWhiteSpace($timestamp)) {
-            $locatorParts += "事件时间 $timestamp（可对照界面显示的分钟）"
-        }
-        if (-not [string]::IsNullOrWhiteSpace($item.TurnId)) {
-            $suffixStart = [Math]::Max(0, $item.TurnId.Length - 8)
-            $locatorParts += "回合 ID 尾号 $($item.TurnId.Substring($suffixStart))"
-        }
-        $turnFileBytes = [Math]::Max(
-            0,
-            [long]$item.EndBytes - [long]$item.StartBytes
-        )
-        $locatorParts += "本轮 JSONL 增长 $(Format-MiB $turnFileBytes)"
-        if ($ShowTurnPreview -and -not [string]::IsNullOrWhiteSpace($item.UserPreview)) {
-            $locatorParts += "用户输入【$($item.UserPreview)】"
-        }
-        "    定位：$($locatorParts -join '；')。"
-    }
-}
-else {
-    '  无法可靠取得：当前文件没有可用的累计 Token 增量。'
-}
-if (-not $ShowTurnPreview) {
-    '  快速定位：重新运行时加 -ShowTurnPreview，可在前三名下显示用户输入摘要；默认关闭以避免意外展示对话内容。'
-}
-
-'本地会话文件占用前三（不等同于 Token 消耗）：'
-if ($fileRankings.Count -gt 0 -and $scanEndPosition -gt 0) {
-    $rankNames = @('第一', '第二', '第三')
-    for ($index = 0; $index -lt $fileRankings.Count; $index++) {
-        $item = $fileRankings[$index]
-        $percentage = [Math]::Round(
-            100 * [double]$item.Value / [double]$scanEndPosition,
-            1
-        ).ToString('F1', [Globalization.CultureInfo]::InvariantCulture)
-        $recordCount = if ($categoryRecords.ContainsKey($item.Key)) {
-            $categoryRecords[$item.Key]
-        }
-        else {
-            0
-        }
-        $byteText = Format-ByteSize $item.Value
-        "  $($rankNames[$index])：$($item.Key)，$byteText，占 $percentage%，涉及 $recordCount 条记录。"
-    }
-}
-else {
-    '  无法取得：未扫描到完整的本地会话记录。'
-}
-
-''
-'四、交接建议'
+'三、交接建议'
+"交接参考综合评分：$totalScore 分（0～1 分继续，2 分准备交接，3 分及以上建议交接。）"
 "交接建议：$advice"
+''
 '参考依据：'
 "  1. $sizeBasis"
 "  2. $contextBasis"
 "  3. $compressionBasis"
-"  4. 综合评分为 $totalScore 分：0～1 分继续，2 分准备交接，3 分及以上建议交接。"
-'  5. 上述分级和 85% 观察线都是本地经验规则，并非 OpenAI 官方限制。'
-'人工判断提醒：请主动判断 AI 是否已出现明显理解不足，例如忘记约束、重复执行或前后矛盾；如已出现，应提高交接优先级。'
+'  4. 上述分级和 85% 观察线都是本地经验规则，并非 OpenAI 官方限制。'
+''
+'人工判断提醒：'
+'请主动判断 AI 是否已出现明显理解不足，例如忘记约束、重复执行或前后矛盾；如已出现，应提高交接优先级。'
 
 if (
     $parseWarnings -gt 0 -or
@@ -1289,7 +1457,7 @@ if (
         "  - 检测到非统一编码或换行；最终文件占用已按实际扫描字节校正，历史里程碑大小可能有轻微偏差。"
     }
     if ($duplicateTurnContextCount -gt 0) {
-        "  - 检测到 $duplicateTurnContextCount 条重复 turn_context；已按回合 ID 或相邻终止边界合并，避免把内部上下文记录误报为界面回合。"
+        "  - 同一界面回合可能包含多条内部上下文记录。本次发现并合并了 $duplicateTurnContextCount 条重复记录，最终识别为 $startedTurnCount 个回合。"
     }
     if ($fileChangedDuringScan) {
         '  - 文件在扫描期间仍有写入；轮次、Token 和内容占比以本次已读取数据为准。'
